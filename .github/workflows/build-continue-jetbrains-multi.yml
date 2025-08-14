@@ -53,8 +53,7 @@ jobs:
             | head -n 5)
 
           echo "Selected tags:"; echo "$TAGS"
-          TAGS_PIPE=$(echo "$TAGS" | tr '
-' '|' | sed 's/|$//')
+          TAGS_PIPE=$(printf '%s\n' "$TAGS" | paste -sd'|' -)
           echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
 
       - name: Build each selected tag
