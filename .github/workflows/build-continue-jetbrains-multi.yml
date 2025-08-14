@@ -89,13 +89,30 @@ jobs:
             # === NVM: install & use Node version required by repo (.nvmrc) ===
             export NVM_DIR="$HOME/.nvm"
             . "$NVM_DIR/nvm.sh"
-            # Если есть .nvmrc в корне — используем; иначе просто 'nvm install' подхватит LTS
+            
+            # прочитать желаемую версию
             if [ -f work/continue/.nvmrc ]; then
-              nvm install
-              nvm use
+              DESIRED="$(tr -d ' \t\r\n' < work/continue/.nvmrc)"
             else
+              DESIRED="lts/*"
+            fi
+            # подстраховка на случай пустого/невалидного .nvmrc
+            if [ -z "$DESIRED" ]; then DESIRED="lts/*"; fi
+            
+            echo "Using Node version from nvm: $DESIRED"
+            # иногда конкретные алиасы недоступны — пробуем последовательно
+            if ! nvm install "$DESIRED"; then
+              echo "WARN: nvm install '$DESIRED' failed, falling back to LTS"
               nvm install --lts
-              nvm use --lts
+              DESIRED="lts/*"
+            fi
+            nvm use "$DESIRED" || nvm use --lts
+            
+            # верификация
+            if ! command -v node >/dev/null 2>&1; then
+              echo "ERROR: node was not installed/activated by nvm"
+              nvm current
+              exit 1
             fi
             node -v
             npm -v
