@@ -34,6 +34,7 @@ jobs:
             ${{ runner.os }}-gradle-
 
       - name: Prepare work dirs
+        shell: bash
         run: |
           set -e
           rm -rf work site
@@ -44,7 +45,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Получить все теги, отфильтровать *jetbrains, отсортировать по версии по убыванию и взять последние 5
           TAGS=$(git ls-remote --tags --refs https://github.com/continuedev/continue.git \
             | awk '{print $2}' \
             | sed 's@refs/tags/@@' \
@@ -53,9 +53,8 @@ jobs:
             | head -n 5)
 
           echo "Selected tags:"; echo "$TAGS"
-
-          # В output — строкой с | в качестве разделителя
-          TAGS_PIPE=$(echo "$TAGS" | tr '\n' '|' | sed 's/|$//')
+          TAGS_PIPE=$(echo "$TAGS" | tr '
+' '|' | sed 's/|$//')
           echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
 
       - name: Build each selected tag
@@ -76,22 +75,63 @@ jobs:
             rm -rf work/continue
             git clone --depth=1 --branch "$TAG" https://github.com/continuedev/continue.git work/continue
 
-            pushd work/continue/extensions/intellij >/dev/null
-            # gradle wrapper в модуле intellij
+            # === autodetect IntelliJ module path ===
+            PLUGIN_MODULE=""
+            for CAND in "extensions/intellij" "plugins/intellij"; do
+              if [ -f "work/continue/$CAND/gradlew" ]; then PLUGIN_MODULE="$CAND"; break; fi
+            done
+            if [ -z "$PLUGIN_MODULE" ]; then
+              echo "IntelliJ module not found for $TAG; skipping"
+              echo "::endgroup::"; continue
+            fi
+
+            # === ensure config_schema.json is present at expected resource path ===
+            # Locate any config_schema.json in repo
+            SCHEMA_SRC=$(cd work/continue && git ls-files | grep -E '/config_schema\.json$' | head -n1 || true)
+            SCHEMA_WANTED="work/continue/$PLUGIN_MODULE/src/main/resources/com/github/continuedev/continueintellijextension/continue/config_schema.json"
+            if [ -n "$SCHEMA_SRC" ]; then
+              mkdir -p "$(dirname "$SCHEMA_WANTED")"
+              cp "work/continue/$SCHEMA_SRC" "$SCHEMA_WANTED"
+              echo "Placed config_schema.json at resources path"
+            else
+              echo "WARN: config_schema.json not found in repo; plugin may fail at runtime"
+            fi
+
+            pushd "work/continue/$PLUGIN_MODULE" >/dev/null
             ./gradlew --no-daemon buildPlugin
             popd >/dev/null
 
-            ZIP=$(ls -1 work/continue/extensions/intellij/build/distributions/*.zip 2>/dev/null | head -n1 || true)
+            ZIP=$(ls -1 "work/continue/$PLUGIN_MODULE/build/distributions"/*.zip 2>/dev/null | head -n1 || true)
             if [ -z "$ZIP" ]; then
               echo "No ZIP produced for $TAG, skipping"
               echo "::endgroup::"
               continue
             fi
 
-            # Распаковать zip, найти plugin.xml: сначала снаружи, затем внутри lib/*.jar
+            # verify config_schema.json exists inside produced ZIP (within JAR)
+            if ! unzip -l "$ZIP" | grep -q 'lib/.*\.jar'; then
+              echo "WARN: no JARs found inside plugin ZIP"
+            else
+              # check inside first jar for the schema (best-effort)
+              FIRST_JAR=$(unzip -Z1 "$ZIP" | grep '^lib/.*\.jar$' | head -n1 || true)
+              if [ -n "$FIRST_JAR" ]; then
+                TMP_DIR=work/inspect
+                rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR"
+                unzip -q "$ZIP" "$FIRST_JAR" -d "$TMP_DIR"
+                if ! unzip -p "$TMP_DIR/$FIRST_JAR" META-INF/plugin.xml >/dev/null 2>&1; then :; fi
+                if ! unzip -p "$TMP_DIR/$FIRST_JAR" com/github/continuedev/continueintellijextension/continue/config_schema.json >/dev/null 2>&1; then
+                  echo "WARN: config_schema.json not found inside JAR (may break JSON schema provider)"
+                else
+                  echo "OK: config_schema.json present inside JAR"
+                fi
+              fi
+            fi
+
+            # Unpack ZIP to extract metadata
             rm -rf work/extract && mkdir -p work/extract
             unzip -q "$ZIP" -d work/extract
 
+            # Find plugin.xml either outside or inside lib/*.jar
             PLUGIN_XML=$(find work/extract -type f -path '*/META-INF/plugin.xml' | head -n1 || true)
             if [ -z "$PLUGIN_XML" ]; then
               JAR_WITH_XML=""
@@ -113,7 +153,7 @@ jobs:
               continue
             fi
 
-            # Достаём id/name/version/since/until (без xmllint)
+            # Parse metadata
             PLUGIN_ID=$(grep -oP '(?<=<id>)[^<]+' "$PLUGIN_XML" || true)
             if [ -z "$PLUGIN_ID" ]; then
               PLUGIN_ID=$(grep -oP '(?<=id=")([^"]+)' "$PLUGIN_XML" | head -n1 || true)
@@ -125,11 +165,11 @@ jobs:
 
             echo "ID=$PLUGIN_ID NAME=$PLUGIN_NAME VERSION=$PLUGIN_VERSION since=$SINCE_BUILD until=$UNTIL_BUILD"
 
-            # Копируем ZIP на сайт
+            # Copy ZIP to site
             cp "$ZIP" site/
             ZIP_NAME=$(basename "$ZIP")
 
-            # Накапливаем записи для updates.xml
+            # Accumulate entries for updates.xml
             {
               echo "<plugin id=\"$PLUGIN_ID\" url=\"__BASE__/$ZIP_NAME\" version=\"$PLUGIN_VERSION\">"
               if [ -n "$SINCE_BUILD" ] || [ -n "$UNTIL_BUILD" ]; then
