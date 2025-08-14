@@ -106,7 +106,8 @@ jobs:
             # === Repo-required dependencies (per CONTRIBUTING.md) ===
             if [ -f work/continue/scripts/install-dependencies.sh ]; then
               chmod +x work/continue/scripts/install-dependencies.sh
-              bash work/continue/scripts/install-dependencies.sh
+              # ВАЖНО: скрипт должен выполняться из корня репозитория Continue
+              (cd work/continue && bash scripts/install-dependencies.sh)
             else
               echo "WARN: scripts/install-dependencies.sh not found; continuing"
             fi
@@ -155,12 +156,10 @@ jobs:
             rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR/zip"
             unzip -q "$ZIP" -d "$TMP_DIR/zip"
 
-            # Gather jars
             mapfile -t JARS < <(find "$TMP_DIR/zip" -type f -path '*/lib/*.jar' | sort)
             if [ "${#JARS[@]}" -eq 0 ]; then
               echo "WARN: no JARs found inside plugin ZIP"
             else
-              # prepare a temp place with both paths
               SHADOW="$TMP_DIR/shadow"
               mkdir -p "$SHADOW/com/github/continuedev/continueintellijextension/continue"
               cp "$PKG_DIR/config_schema.json" "$SHADOW/com/github/continuedev/continueintellijextension/continue/config_schema.json"
@@ -183,9 +182,7 @@ jobs:
 
                 if [ "$NEED_UPDATE" = true ]; then
                   echo "Updating $(basename "$J") with schemas"
-                  # Use 'jar uf' to update jar with multiple files
                   pushd "$SHADOW" >/dev/null
-                  # add both paths (ignore errors if already present)
                   jar uf "$J" \
                     com/github/continuedev/continueintellijextension/continue/config_schema.json \
                     com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json \
