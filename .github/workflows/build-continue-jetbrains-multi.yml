@@ -1,0 +1,158 @@
+name: Build last 5 Continue (JetBrains) and publish to Pages
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 3 * * 1"   # раз в неделю по понедельникам (можешь убрать)
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Prepare work dirs
+        run: |
+          set -e
+          rm -rf work site
+          mkdir -p work site
+
+      - name: Fetch tags from continuedev/continue
+        id: tags
+        run: |
+          set -e
+          # получить все теги, отфильтровать jetbrains, отсортировать по версии убыв.
+          TAGS=$(git ls-remote --tags --refs https://github.com/continuedev/continue.git \
+            | awk '{print $2}' \
+            | sed 's@refs/tags/@@' \
+            | grep -E 'jetbrains$' \
+            | sort -V -r \
+            | head -n 5)
+
+          echo "Selected tags:"
+          echo "$TAGS"
+
+          # сохранить в output как строку с разделителем |
+          TAGS_PIPE=$(echo "$TAGS" | tr '\n' '|' | sed 's/|$//')
+          echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
+
+      - name: Build each selected tag
+        id: buildall
+        run: |
+          set -e
+          IFS='|' read -r -a TAGS <<< "${{ steps.tags.outputs.tags }}"
+          built_list=""
+
+          for TAG in "${TAGS[@]}"; do
+            echo "::group::Building $TAG"
+            rm -rf work/continue
+            git clone --depth=1 --branch "$TAG" https://github.com/continuedev/continue.git work/continue
+
+            pushd work/continue/extensions/intellij >/dev/null
+            # gradle wrapper в модуле intellij
+            ./gradlew --no-daemon buildPlugin
+            popd >/dev/null
+
+            ZIP=$(ls -1 work/continue/extensions/intellij/build/distributions/*.zip | head -n1 || true)
+            if [ -z "$ZIP" ]; then
+              echo "No ZIP produced for $TAG, skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # распакуем, вытащим метаданные
+            mkdir -p work/extract
+            rm -rf work/extract/*
+            unzip -q "$ZIP" -d work/extract
+
+            PLUGIN_XML=$(find work/extract -type f -path "*/META-INF/plugin.xml" | head -n1 || true)
+            if [ -z "$PLUGIN_XML" ]; then
+              echo "plugin.xml not found for $TAG, skipping"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # достаём id/name/version/since/until
+            PLUGIN_ID=$(grep -oP '(?<=<id>)[^<]+' "$PLUGIN_XML" || true)
+            [ -z "$PLUGIN_ID" ] && PLUGIN_ID=$(grep -oP '(?<=id=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
+            PLUGIN_NAME=$(grep -oP '(?<=<name>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
+            PLUGIN_VERSION=$(grep -oP '(?<=<version>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
+            SINCE_BUILD=$(grep -oP '(?<=<idea-version[^>]*since-build=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
+            UNTIL_BUILD=$(grep -oP '(?<=<idea-version[^>]*until-build=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
+
+            echo "ID=$PLUGIN_ID NAME=$PLUGIN_NAME VERSION=$PLUGIN_VERSION since=$SINCE_BUILD until=$UNTIL_BUILD"
+
+            # копируем ZIP в сайт
+            cp "$ZIP" "site/"
+            ZIP_NAME=$(basename "$ZIP")
+
+            # аккумулируем метаданные для updates.xml (через маркдаун/временный файл)
+            {
+              echo "<plugin id=\"$PLUGIN_ID\" url=\"__BASE__/$ZIP_NAME\" version=\"$PLUGIN_VERSION\">"
+              if [ -n "$SINCE_BUILD" ] || [ -n "$UNTIL_BUILD" ]; then
+                printf "  <idea-version"
+                [ -n "$SINCE_BUILD" ] && printf " since-build=\"%s\"" "$SINCE_BUILD"
+                [ -n "$UNTIL_BUILD" ] && printf " until-build=\"%s\"" "$UNTIL_BUILD"
+                echo " />"
+              fi
+              [ -n "$PLUGIN_NAME" ] && echo "  <name>$PLUGIN_NAME</name>"
+              echo "</plugin>"
+            } >> site/.plugins.tmp.xml
+
+            built_list="$built_list $ZIP_NAME"
+            echo "::endgroup::"
+          done
+
+          if [ ! -s site/.plugins.tmp.xml ]; then
+            echo "No plugins built — failing the job."
+            exit 1
+          fi
+
+          echo "built_list=${built_list}" >> "$GITHUB_OUTPUT"
+
+      - name: Generate updates.xml
+        run: |
+          set -e
+          OWNER="${GITHUB_REPOSITORY%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          BASE_URL="https://${OWNER}.github.io/${REPO}"
+
+          # заменить плейсхолдер __BASE__ на реальный BASE_URL
+          sed "s#__BASE__#${BASE_URL}#g" site/.plugins.tmp.xml > site/.plugins.ready.xml
+
+          {
+            echo "<plugins>"
+            cat site/.plugins.ready.xml
+            echo "</plugins>"
+          } > site/updates.xml
+
+          echo "updates.xml:"
+          cat site/updates.xml
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
