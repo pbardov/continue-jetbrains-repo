@@ -39,7 +39,7 @@ jobs:
             | sed 's@refs/tags/@@' \
             | grep -E 'jetbrains$' \
             | sort -V -r \
-            | head -n 5)
+            | head -n 2)
 
           echo "Selected tags:"
           echo "$TAGS"
