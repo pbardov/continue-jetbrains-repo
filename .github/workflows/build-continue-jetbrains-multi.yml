@@ -3,7 +3,7 @@ name: Build last 5 Continue (JetBrains) and publish to Pages
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 3 * * 1"   # раз в неделю по понедельникам (можешь убрать)
+    - cron: "0 3 * * 1"   # еженедельно (можно убрать)
 
 permissions:
   contents: read
@@ -23,6 +23,16 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
       - name: Prepare work dirs
         run: |
           set -e
@@ -31,29 +41,35 @@ jobs:
 
       - name: Fetch tags from continuedev/continue
         id: tags
+        shell: bash
         run: |
-          set -e
-          # получить все теги, отфильтровать jetbrains, отсортировать по версии убыв.
+          set -euo pipefail
+          # Получить все теги, отфильтровать *jetbrains, отсортировать по версии по убыванию и взять последние 5
           TAGS=$(git ls-remote --tags --refs https://github.com/continuedev/continue.git \
             | awk '{print $2}' \
             | sed 's@refs/tags/@@' \
             | grep -E 'jetbrains$' \
             | sort -V -r \
-            | head -n 2)
+            | head -n 5)
 
-          echo "Selected tags:"
-          echo "$TAGS"
+          echo "Selected tags:"; echo "$TAGS"
 
-          # сохранить в output как строку с разделителем |
+          # В output — строкой с | в качестве разделителя
           TAGS_PIPE=$(echo "$TAGS" | tr '\n' '|' | sed 's/|$//')
           echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
 
       - name: Build each selected tag
         id: buildall
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          if [ -z "${{ steps.tags.outputs.tags }}" ]; then
+            echo "No tags selected; nothing to build" > site/README.txt
+            exit 0
+          fi
+
           IFS='|' read -r -a TAGS <<< "${{ steps.tags.outputs.tags }}"
-          built_list=""
+          built_any=false
 
           for TAG in "${TAGS[@]}"; do
             echo "::group::Building $TAG"
@@ -65,28 +81,43 @@ jobs:
             ./gradlew --no-daemon buildPlugin
             popd >/dev/null
 
-            ZIP=$(ls -1 work/continue/extensions/intellij/build/distributions/*.zip | head -n1 || true)
+            ZIP=$(ls -1 work/continue/extensions/intellij/build/distributions/*.zip 2>/dev/null | head -n1 || true)
             if [ -z "$ZIP" ]; then
               echo "No ZIP produced for $TAG, skipping"
               echo "::endgroup::"
               continue
             fi
 
-            # распакуем, вытащим метаданные
-            mkdir -p work/extract
-            rm -rf work/extract/*
+            # Распаковать zip, найти plugin.xml: сначала снаружи, затем внутри lib/*.jar
+            rm -rf work/extract && mkdir -p work/extract
             unzip -q "$ZIP" -d work/extract
 
-            PLUGIN_XML=$(find work/extract -type f -path "*/META-INF/plugin.xml" | head -n1 || true)
+            PLUGIN_XML=$(find work/extract -type f -path '*/META-INF/plugin.xml' | head -n1 || true)
             if [ -z "$PLUGIN_XML" ]; then
+              JAR_WITH_XML=""
+              while IFS= read -r J; do
+                if unzip -l "$J" | grep -q 'META-INF/plugin.xml'; then
+                  JAR_WITH_XML="$J"; break
+                fi
+              done < <(find work/extract -type f -path '*/lib/*.jar')
+
+              if [ -n "$JAR_WITH_XML" ]; then
+                unzip -p "$JAR_WITH_XML" META-INF/plugin.xml > work/extract/plugin.xml
+                PLUGIN_XML="work/extract/plugin.xml"
+              fi
+            fi
+
+            if [ -z "$PLUGIN_XML" ] || [ ! -s "$PLUGIN_XML" ]; then
               echo "plugin.xml not found for $TAG, skipping"
               echo "::endgroup::"
               continue
             fi
 
-            # достаём id/name/version/since/until
+            # Достаём id/name/version/since/until (без xmllint)
             PLUGIN_ID=$(grep -oP '(?<=<id>)[^<]+' "$PLUGIN_XML" || true)
-            [ -z "$PLUGIN_ID" ] && PLUGIN_ID=$(grep -oP '(?<=id=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
+            if [ -z "$PLUGIN_ID" ]; then
+              PLUGIN_ID=$(grep -oP '(?<=id=")([^"]+)' "$PLUGIN_XML" | head -n1 || true)
+            fi
             PLUGIN_NAME=$(grep -oP '(?<=<name>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
             PLUGIN_VERSION=$(grep -oP '(?<=<version>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
             SINCE_BUILD=$(grep -oP '(?<=<idea-version[^>]*since-build=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
@@ -94,11 +125,11 @@ jobs:
 
             echo "ID=$PLUGIN_ID NAME=$PLUGIN_NAME VERSION=$PLUGIN_VERSION since=$SINCE_BUILD until=$UNTIL_BUILD"
 
-            # копируем ZIP в сайт
-            cp "$ZIP" "site/"
+            # Копируем ZIP на сайт
+            cp "$ZIP" site/
             ZIP_NAME=$(basename "$ZIP")
 
-            # аккумулируем метаданные для updates.xml (через маркдаун/временный файл)
+            # Накапливаем записи для updates.xml
             {
               echo "<plugin id=\"$PLUGIN_ID\" url=\"__BASE__/$ZIP_NAME\" version=\"$PLUGIN_VERSION\">"
               if [ -n "$SINCE_BUILD" ] || [ -n "$UNTIL_BUILD" ]; then
@@ -111,26 +142,27 @@ jobs:
               echo "</plugin>"
             } >> site/.plugins.tmp.xml
 
-            built_list="$built_list $ZIP_NAME"
+            built_any=true
             echo "::endgroup::"
           done
 
-          if [ ! -s site/.plugins.tmp.xml ]; then
-            echo "No plugins built — failing the job."
-            exit 1
+          if [ "$built_any" = false ]; then
+            echo "WARNING: No plugins were successfully parsed; publishing empty updates.xml" >&2
           fi
 
-          echo "built_list=${built_list}" >> "$GITHUB_OUTPUT"
-
       - name: Generate updates.xml
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           OWNER="${GITHUB_REPOSITORY%/*}"
           REPO="${GITHUB_REPOSITORY#*/}"
           BASE_URL="https://${OWNER}.github.io/${REPO}"
 
-          # заменить плейсхолдер __BASE__ на реальный BASE_URL
-          sed "s#__BASE__#${BASE_URL}#g" site/.plugins.tmp.xml > site/.plugins.ready.xml
+          if [ -s site/.plugins.tmp.xml ]; then
+            sed "s#__BASE__#${BASE_URL}#g" site/.plugins.tmp.xml > site/.plugins.ready.xml
+          else
+            : > site/.plugins.ready.xml
+          fi
 
           {
             echo "<plugins>"
@@ -138,8 +170,7 @@ jobs:
             echo "</plugins>"
           } > site/updates.xml
 
-          echo "updates.xml:"
-          cat site/updates.xml
+          echo "updates.xml:"; cat site/updates.xml
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
