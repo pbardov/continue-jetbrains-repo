@@ -40,7 +40,7 @@ jobs:
           rm -rf work site
           mkdir -p work site
 
-      - name: Fetch tags from continuedev/continue
+      - name: Fetch last 5 *jetbrains tags from continuedev/continue
         id: tags
         shell: bash
         run: |
@@ -51,20 +51,15 @@ jobs:
             | grep -E 'jetbrains$' \
             | sort -V -r \
             | head -n 5)
+          echo "Selected tags:"; echo "$TAGS"
+          echo "tags=$(printf '%s\n' "$TAGS" | paste -sd'|' -)" >> "$GITHUB_OUTPUT"
 
-          echo "Selected tags:"
-          echo "$TAGS"
-
-          TAGS_PIPE=$(printf '%s\n' "$TAGS" | paste -sd'|' -)
-          echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
-
-      - name: Install NVM (global)  # доступен для последующих шагов через source
+      - name: Install NVM
         shell: bash
         run: |
           set -euo pipefail
           export NVM_DIR="$HOME/.nvm"
-          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-          # Проверка
+          curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
           . "$NVM_DIR/nvm.sh"
           nvm --version
 
@@ -86,42 +81,34 @@ jobs:
             rm -rf work/continue
             git clone --depth=1 --branch "$TAG" https://github.com/continuedev/continue.git work/continue
 
-            # === NVM: install & use Node version required by repo (.nvmrc) ===
+            # === NVM: install & use version from .nvmrc (fallback LTS) ===
             export NVM_DIR="$HOME/.nvm"
             . "$NVM_DIR/nvm.sh"
-            
-            # прочитать желаемую версию
             if [ -f work/continue/.nvmrc ]; then
               DESIRED="$(tr -d ' \t\r\n' < work/continue/.nvmrc)"
             else
               DESIRED="lts/*"
             fi
-            # подстраховка на случай пустого/невалидного .nvmrc
-            if [ -z "$DESIRED" ]; then DESIRED="lts/*"; fi
-            
-            echo "Using Node version from nvm: $DESIRED"
-            # иногда конкретные алиасы недоступны — пробуем последовательно
+            [ -z "$DESIRED" ] && DESIRED="lts/*"
+            echo "Using Node via nvm: $DESIRED"
             if ! nvm install "$DESIRED"; then
               echo "WARN: nvm install '$DESIRED' failed, falling back to LTS"
               nvm install --lts
               DESIRED="lts/*"
             fi
             nvm use "$DESIRED" || nvm use --lts
-            
-            # верификация
-            if ! command -v node >/dev/null 2>&1; then
-              echo "ERROR: node was not installed/activated by nvm"
-              nvm current
-              exit 1
-            fi
+            # corepack for pnpm/yarn if needed
+            corepack enable || true
+            corepack prepare pnpm@latest --activate || true
             node -v
             npm -v
 
-            # === Обязательные зависимости по инструкции (CONTRIBUTING.md) ===
-            if [ -x work/continue/scripts/install-dependencies.sh ]; then
+            # === Repo-required dependencies (per CONTRIBUTING.md) ===
+            if [ -f work/continue/scripts/install-dependencies.sh ]; then
+              chmod +x work/continue/scripts/install-dependencies.sh
               bash work/continue/scripts/install-dependencies.sh
             else
-              echo "WARN: scripts/install-dependencies.sh not found/executable; continuing"
+              echo "WARN: scripts/install-dependencies.sh not found; continuing"
             fi
 
             # === autodetect IntelliJ module path ===
@@ -135,17 +122,21 @@ jobs:
               continue
             fi
 
-            # === ensure config_schema.json is present at expected resource path (safety) ===
-            SCHEMA_SRC=$(cd work/continue && git ls-files | grep -E '/config_schema\.json$' | head -n1 || true)
-            SCHEMA_WANTED="work/continue/$PLUGIN_MODULE/src/main/resources/com/github/continuedev/continueintellijextension/continue/config_schema.json"
-            mkdir -p "$(dirname "$SCHEMA_WANTED")"
-            if [ -n "$SCHEMA_SRC" ]; then
-              cp "work/continue/$SCHEMA_SRC" "$SCHEMA_WANTED"
-              echo "Placed config_schema.json from repo"
-            else
-              echo 'Creating minimal fallback config_schema.json'
-              printf '%s' '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}' > "$SCHEMA_WANTED"
-            fi
+            # === Ensure schemas exist in resources (both pkg path and root) ===
+            SRC_DIR="work/continue/$PLUGIN_MODULE/src/main/resources"
+            PKG_DIR="$SRC_DIR/com/github/continuedev/continueintellijextension/continue"
+            mkdir -p "$PKG_DIR"
+            for F in config_schema.json continue_rc_schema.json; do
+              FOUND=$(cd work/continue && git ls-files | grep -E "/$F$" | head -n1 || true)
+              if [ -n "$FOUND" ]; then
+                cp "work/continue/$FOUND" "$PKG_DIR/$F"
+                cp "work/continue/$FOUND" "$SRC_DIR/$F"
+              else
+                echo "WARN: $F not found in repo; creating minimal fallback"
+                printf '%s' '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}' > "$PKG_DIR/$F"
+                cp "$PKG_DIR/$F" "$SRC_DIR/$F"
+              fi
+            done
 
             # === build plugin ===
             pushd "work/continue/$PLUGIN_MODULE" >/dev/null
@@ -159,29 +150,55 @@ jobs:
               continue
             fi
 
-            # --- Inspect and inject config_schema.json into ALL plugin JARs if missing ---
+            # --- Inspect and inject schemas into ALL plugin JARs if missing ---
             TMP_DIR=work/inspect
             rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR/zip"
             unzip -q "$ZIP" -d "$TMP_DIR/zip"
 
-            JARS=$(find "$TMP_DIR/zip" -type f -path '*/lib/*.jar' | sort)
-            if [ -z "$JARS" ]; then
+            # Gather jars
+            mapfile -t JARS < <(find "$TMP_DIR/zip" -type f -path '*/lib/*.jar' | sort)
+            if [ "${#JARS[@]}" -eq 0 ]; then
               echo "WARN: no JARs found inside plugin ZIP"
             else
-              for J in $JARS; do
-                if unzip -l "$J" | grep -q 'com/github/continuedev/continueintellijextension/continue/config_schema.json'; then
-                  echo "OK: schema present in $(basename "$J")"
+              # prepare a temp place with both paths
+              SHADOW="$TMP_DIR/shadow"
+              mkdir -p "$SHADOW/com/github/continuedev/continueintellijextension/continue"
+              cp "$PKG_DIR/config_schema.json" "$SHADOW/com/github/continuedev/continueintellijextension/continue/config_schema.json"
+              cp "$PKG_DIR/continue_rc_schema.json" "$SHADOW/com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json"
+              cp "$PKG_DIR/config_schema.json" "$SHADOW/config_schema.json"
+              cp "$PKG_DIR/continue_rc_schema.json" "$SHADOW/continue_rc_schema.json"
+
+              for J in "${JARS[@]}"; do
+                NEED_UPDATE=false
+                for P in \
+                  com/github/continuedev/continueintellijextension/continue/config_schema.json \
+                  com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json \
+                  config_schema.json \
+                  continue_rc_schema.json
+                do
+                  if ! unzip -l "$J" | grep -q "$P"; then
+                    NEED_UPDATE=true
+                  fi
+                done
+
+                if [ "$NEED_UPDATE" = true ]; then
+                  echo "Updating $(basename "$J") with schemas"
+                  # Use 'jar uf' to update jar with multiple files
+                  pushd "$SHADOW" >/dev/null
+                  # add both paths (ignore errors if already present)
+                  jar uf "$J" \
+                    com/github/continuedev/continueintellijextension/continue/config_schema.json \
+                    com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json \
+                    config_schema.json \
+                    continue_rc_schema.json || true
+                  popd >/dev/null
                 else
-                  echo "Injecting schema into $(basename "$J")"
-                  WRK="$TMP_DIR/jarwrk"
-                  rm -rf "$WRK" && mkdir -p "$WRK/com/github/continuedev/continueintellijextension/continue"
-                  cp "$SCHEMA_WANTED" "$WRK/com/github/continuedev/continueintellijextension/continue/config_schema.json"
-                  (cd "$WRK" && zip -q -u "$J" com/github/continuedev/continueintellijextension/continue/config_schema.json)
+                  echo "OK: $(basename "$J") already contains schemas"
                 fi
               done
             fi
 
-            # Rebuild plugin ZIP from modified tree to ensure IDE receives updated JARs
+            # Rebuild plugin ZIP from modified tree
             rm -f "$TMP_DIR/rebuilt.zip"
             (cd "$TMP_DIR/zip" && zip -q -r "$PWD/../rebuilt.zip" .)
             mv "$TMP_DIR/rebuilt.zip" "$ZIP"
