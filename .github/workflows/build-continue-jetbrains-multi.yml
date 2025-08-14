@@ -17,7 +17,7 @@ jobs:
       - name: Checkout this repo
         uses: actions/checkout@v4
 
-      - name: Set up Java 17
+      - name: Set up Java 17 (for IntelliJ Gradle plugin)
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -52,9 +52,21 @@ jobs:
             | sort -V -r \
             | head -n 5)
 
-          echo "Selected tags:"; echo "$TAGS"
+          echo "Selected tags:"
+          echo "$TAGS"
+
           TAGS_PIPE=$(printf '%s\n' "$TAGS" | paste -sd'|' -)
           echo "tags=$TAGS_PIPE" >> "$GITHUB_OUTPUT"
+
+      - name: Install NVM (global)  # доступен для последующих шагов через source
+        shell: bash
+        run: |
+          set -euo pipefail
+          export NVM_DIR="$HOME/.nvm"
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+          # Проверка
+          . "$NVM_DIR/nvm.sh"
+          nvm --version
 
       - name: Build each selected tag
         id: buildall
@@ -74,6 +86,27 @@ jobs:
             rm -rf work/continue
             git clone --depth=1 --branch "$TAG" https://github.com/continuedev/continue.git work/continue
 
+            # === NVM: install & use Node version required by repo (.nvmrc) ===
+            export NVM_DIR="$HOME/.nvm"
+            . "$NVM_DIR/nvm.sh"
+            # Если есть .nvmrc в корне — используем; иначе просто 'nvm install' подхватит LTS
+            if [ -f work/continue/.nvmrc ]; then
+              nvm install
+              nvm use
+            else
+              nvm install --lts
+              nvm use --lts
+            fi
+            node -v
+            npm -v
+
+            # === Обязательные зависимости по инструкции (CONTRIBUTING.md) ===
+            if [ -x work/continue/scripts/install-dependencies.sh ]; then
+              bash work/continue/scripts/install-dependencies.sh
+            else
+              echo "WARN: scripts/install-dependencies.sh not found/executable; continuing"
+            fi
+
             # === autodetect IntelliJ module path ===
             PLUGIN_MODULE=""
             for CAND in "extensions/intellij" "plugins/intellij"; do
@@ -81,21 +114,23 @@ jobs:
             done
             if [ -z "$PLUGIN_MODULE" ]; then
               echo "IntelliJ module not found for $TAG; skipping"
-              echo "::endgroup::"; continue
+              echo "::endgroup::"
+              continue
             fi
 
-            # === ensure config_schema.json is present at expected resource path ===
-            # Locate any config_schema.json in repo
+            # === ensure config_schema.json is present at expected resource path (safety) ===
             SCHEMA_SRC=$(cd work/continue && git ls-files | grep -E '/config_schema\.json$' | head -n1 || true)
             SCHEMA_WANTED="work/continue/$PLUGIN_MODULE/src/main/resources/com/github/continuedev/continueintellijextension/continue/config_schema.json"
+            mkdir -p "$(dirname "$SCHEMA_WANTED")"
             if [ -n "$SCHEMA_SRC" ]; then
-              mkdir -p "$(dirname "$SCHEMA_WANTED")"
               cp "work/continue/$SCHEMA_SRC" "$SCHEMA_WANTED"
-              echo "Placed config_schema.json at resources path"
+              echo "Placed config_schema.json from repo"
             else
-              echo "WARN: config_schema.json not found in repo; plugin may fail at runtime"
+              echo 'Creating minimal fallback config_schema.json'
+              printf '%s' '{"$schema":"http://json-schema.org/draft-07/schema#","type":"object"}' > "$SCHEMA_WANTED"
             fi
 
+            # === build plugin ===
             pushd "work/continue/$PLUGIN_MODULE" >/dev/null
             ./gradlew --no-daemon buildPlugin
             popd >/dev/null
@@ -107,26 +142,34 @@ jobs:
               continue
             fi
 
-            # verify config_schema.json exists inside produced ZIP (within JAR)
-            if ! unzip -l "$ZIP" | grep -q 'lib/.*\.jar'; then
+            # --- Inspect and inject config_schema.json into ALL plugin JARs if missing ---
+            TMP_DIR=work/inspect
+            rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR/zip"
+            unzip -q "$ZIP" -d "$TMP_DIR/zip"
+
+            JARS=$(find "$TMP_DIR/zip" -type f -path '*/lib/*.jar' | sort)
+            if [ -z "$JARS" ]; then
               echo "WARN: no JARs found inside plugin ZIP"
             else
-              # check inside first jar for the schema (best-effort)
-              FIRST_JAR=$(unzip -Z1 "$ZIP" | grep '^lib/.*\.jar$' | head -n1 || true)
-              if [ -n "$FIRST_JAR" ]; then
-                TMP_DIR=work/inspect
-                rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR"
-                unzip -q "$ZIP" "$FIRST_JAR" -d "$TMP_DIR"
-                if ! unzip -p "$TMP_DIR/$FIRST_JAR" META-INF/plugin.xml >/dev/null 2>&1; then :; fi
-                if ! unzip -p "$TMP_DIR/$FIRST_JAR" com/github/continuedev/continueintellijextension/continue/config_schema.json >/dev/null 2>&1; then
-                  echo "WARN: config_schema.json not found inside JAR (may break JSON schema provider)"
+              for J in $JARS; do
+                if unzip -l "$J" | grep -q 'com/github/continuedev/continueintellijextension/continue/config_schema.json'; then
+                  echo "OK: schema present in $(basename "$J")"
                 else
-                  echo "OK: config_schema.json present inside JAR"
+                  echo "Injecting schema into $(basename "$J")"
+                  WRK="$TMP_DIR/jarwrk"
+                  rm -rf "$WRK" && mkdir -p "$WRK/com/github/continuedev/continueintellijextension/continue"
+                  cp "$SCHEMA_WANTED" "$WRK/com/github/continuedev/continueintellijextension/continue/config_schema.json"
+                  (cd "$WRK" && zip -q -u "$J" com/github/continuedev/continueintellijextension/continue/config_schema.json)
                 fi
-              fi
+              done
             fi
 
-            # Unpack ZIP to extract metadata
+            # Rebuild plugin ZIP from modified tree to ensure IDE receives updated JARs
+            rm -f "$TMP_DIR/rebuilt.zip"
+            (cd "$TMP_DIR/zip" && zip -q -r "$PWD/../rebuilt.zip" .)
+            mv "$TMP_DIR/rebuilt.zip" "$ZIP"
+
+            # Unpack for metadata extraction
             rm -rf work/extract && mkdir -p work/extract
             unzip -q "$ZIP" -d work/extract
 
@@ -155,16 +198,16 @@ jobs:
             # Parse metadata
             PLUGIN_ID=$(grep -oP '(?<=<id>)[^<]+' "$PLUGIN_XML" || true)
             if [ -z "$PLUGIN_ID" ]; then
-              PLUGIN_ID=$(grep -oP '(?<=id=")([^"]+)' "$PLUGIN_XML" | head -n1 || true)
+              PLUGIN_ID=$(grep -oP '(?<=id=\")([^\"]+)' "$PLUGIN_XML" | head -n1 || true)
             fi
             PLUGIN_NAME=$(grep -oP '(?<=<name>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
             PLUGIN_VERSION=$(grep -oP '(?<=<version>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
-            SINCE_BUILD=$(grep -oP '(?<=<idea-version[^>]*since-build=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
-            UNTIL_BUILD=$(grep -oP '(?<=<idea-version[^>]*until-build=")[^"]+' "$PLUGIN_XML" | head -n1 || true)
+            SINCE_BUILD=$(grep -oP '(?<=<idea-version[^>]*since-build=\")[^\"]+' "$PLUGIN_XML" | head -n1 || true)
+            UNTIL_BUILD=$(grep -oP '(?<=<idea-version[^>]*until-build=\")[^\"]+' "$PLUGIN_XML" | head -n1 || true)
 
             echo "ID=$PLUGIN_ID NAME=$PLUGIN_NAME VERSION=$PLUGIN_VERSION since=$SINCE_BUILD until=$UNTIL_BUILD"
 
-            # Copy ZIP to site
+            # Publish ZIP to site
             cp "$ZIP" site/
             ZIP_NAME=$(basename "$ZIP")
 
@@ -187,7 +230,6 @@ jobs:
 
           if [ "$built_any" = false ]; then
             echo "WARNING: No plugins were successfully parsed; publishing empty updates.xml" >&2
-          fi
 
       - name: Generate updates.xml
         shell: bash
@@ -209,7 +251,8 @@ jobs:
             echo "</plugins>"
           } > site/updates.xml
 
-          echo "updates.xml:"; cat site/updates.xml
+          echo "updates.xml:"
+          cat site/updates.xml
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
