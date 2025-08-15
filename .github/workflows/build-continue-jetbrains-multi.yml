@@ -97,7 +97,6 @@ jobs:
               DESIRED="lts/*"
             fi
             nvm use "$DESIRED" || nvm use --lts
-            # corepack for pnpm/yarn if needed
             corepack enable || true
             corepack prepare pnpm@latest --activate || true
             node -v
@@ -106,7 +105,6 @@ jobs:
             # === Repo-required dependencies (per CONTRIBUTING.md) ===
             if [ -f work/continue/scripts/install-dependencies.sh ]; then
               chmod +x work/continue/scripts/install-dependencies.sh
-              # ВАЖНО: скрипт должен выполняться из корня репозитория Continue
               (cd work/continue && bash scripts/install-dependencies.sh)
             else
               echo "WARN: scripts/install-dependencies.sh not found; continuing"
@@ -151,7 +149,7 @@ jobs:
               continue
             fi
 
-            # --- Inspect and inject schemas into ALL plugin JARs if missing ---
+            # --- Inspect and (re)build ALL plugin JARs with schemas (no in-place jar uf) ---
             TMP_DIR=work/inspect
             rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR/zip"
             unzip -q "$ZIP" -d "$TMP_DIR/zip"
@@ -160,6 +158,7 @@ jobs:
             if [ "${#JARS[@]}" -eq 0 ]; then
               echo "WARN: no JARs found inside plugin ZIP"
             else
+              # files to add (both places)
               SHADOW="$TMP_DIR/shadow"
               mkdir -p "$SHADOW/com/github/continuedev/continueintellijextension/continue"
               cp "$PKG_DIR/config_schema.json" "$SHADOW/com/github/continuedev/continueintellijextension/continue/config_schema.json"
@@ -168,30 +167,27 @@ jobs:
               cp "$PKG_DIR/continue_rc_schema.json" "$SHADOW/continue_rc_schema.json"
 
               for J in "${JARS[@]}"; do
-                NEED_UPDATE=false
-                for P in \
-                  com/github/continuedev/continueintellijextension/continue/config_schema.json \
-                  com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json \
-                  config_schema.json \
-                  continue_rc_schema.json
-                do
-                  if ! unzip -l "$J" | grep -q "$P"; then
-                    NEED_UPDATE=true
-                  fi
-                done
+                echo "Rebuilding $(basename "$J") with schemas (if missing)"
 
-                if [ "$NEED_UPDATE" = true ]; then
-                  echo "Updating $(basename "$J") with schemas"
-                  pushd "$SHADOW" >/dev/null
-                  jar uf "$J" \
-                    com/github/continuedev/continueintellijextension/continue/config_schema.json \
-                    com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json \
-                    config_schema.json \
-                    continue_rc_schema.json || true
-                  popd >/dev/null
+                WRK="$TMP_DIR/jarwrk"
+                rm -rf "$WRK" && mkdir -p "$WRK"
+                unzip -q "$J" -d "$WRK"
+
+                # copy schemas into both paths (overwrite or add)
+                mkdir -p "$WRK/com/github/continuedev/continueintellijextension/continue"
+                cp "$SHADOW/com/github/continuedev/continueintellijextension/continue/config_schema.json" "$WRK/com/github/continuedev/continueintellijextension/continue/config_schema.json"
+                cp "$SHADOW/com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json" "$WRK/com/github/continuedev/continueintellijextension/continue/continue_rc_schema.json"
+                cp "$SHADOW/config_schema.json" "$WRK/config_schema.json"
+                cp "$SHADOW/continue_rc_schema.json" "$WRK/continue_rc_schema.json"
+
+                # Recreate jar in a temp file (preserve manifest if present)
+                NEWJ="$WRK.new.jar"
+                if [ -f "$WRK/META-INF/MANIFEST.MF" ]; then
+                  (cd "$WRK" && jar cfm "$NEWJ" "META-INF/MANIFEST.MF" . >/dev/null)
                 else
-                  echo "OK: $(basename "$J") already contains schemas"
+                  (cd "$WRK" && jar cf "$NEWJ" . >/dev/null)
                 fi
+                mv -f "$NEWJ" "$J"
               done
             fi
 
@@ -226,15 +222,12 @@ jobs:
               continue
             fi
 
-            # Parse metadata
-            PLUGIN_ID=$(grep -oP '(?<=<id>)[^<]+' "$PLUGIN_XML" || true)
-            if [ -z "$PLUGIN_ID" ]; then
-              PLUGIN_ID=$(grep -oP '(?<=id=\")([^\"]+)' "$PLUGIN_XML" | head -n1 || true)
-            fi
-            PLUGIN_NAME=$(grep -oP '(?<=<name>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
-            PLUGIN_VERSION=$(grep -oP '(?<=<version>)[^<]+' "$PLUGIN_XML" | head -n1 || true)
-            SINCE_BUILD=$(grep -oP '(?<=<idea-version[^>]*since-build=\")[^\"]+' "$PLUGIN_XML" | head -n1 || true)
-            UNTIL_BUILD=$(grep -oP '(?<=<idea-version[^>]*until-build=\")[^\"]+' "$PLUGIN_XML" | head -n1 || true)
+            # Parse metadata (no lookbehind)
+            PLUGIN_ID=$(perl -ne 'if(/<id>([^<]+)/){print $1;exit} if(/id="([^"]+)/){print $1;exit}' "$PLUGIN_XML")
+            PLUGIN_NAME=$(perl -ne 'if(/<name>([^<]+)/){print $1;exit}' "$PLUGIN_XML")
+            PLUGIN_VERSION=$(perl -ne 'if(/<version>([^<]+)/){print $1;exit}' "$PLUGIN_XML")
+            SINCE_BUILD=$(perl -ne 'if(/since-build="([^"]+)/){print $1;exit}' "$PLUGIN_XML")
+            UNTIL_BUILD=$(perl -ne 'if(/until-build="([^"]+)/){print $1;exit}' "$PLUGIN_XML")
 
             echo "ID=$PLUGIN_ID NAME=$PLUGIN_NAME VERSION=$PLUGIN_VERSION since=$SINCE_BUILD until=$UNTIL_BUILD"
 
