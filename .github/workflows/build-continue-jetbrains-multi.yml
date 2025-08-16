@@ -149,7 +149,7 @@ jobs:
               continue
             fi
 
-            # --- Inspect and (re)build ALL plugin JARs with schemas (no in-place jar uf) ---
+            # --- Inspect and REBUILD ALL plugin JARs with schemas (no in-place jar uf) ---
             TMP_DIR=work/inspect
             rm -rf "$TMP_DIR" && mkdir -p "$TMP_DIR/zip"
             unzip -q "$ZIP" -d "$TMP_DIR/zip"
@@ -158,7 +158,6 @@ jobs:
             if [ "${#JARS[@]}" -eq 0 ]; then
               echo "WARN: no JARs found inside plugin ZIP"
             else
-              # files to add (both places)
               SHADOW="$TMP_DIR/shadow"
               mkdir -p "$SHADOW/com/github/continuedev/continueintellijextension/continue"
               cp "$PKG_DIR/config_schema.json" "$SHADOW/com/github/continuedev/continueintellijextension/continue/config_schema.json"
@@ -180,13 +179,17 @@ jobs:
                 cp "$SHADOW/config_schema.json" "$WRK/config_schema.json"
                 cp "$SHADOW/continue_rc_schema.json" "$WRK/continue_rc_schema.json"
 
-                # Recreate jar in a temp file (preserve manifest if present)
-                NEWJ="$WRK.new.jar"
+                # Recreate jar **in the same directory as original** to avoid temp move issues
+                JDIR="$(dirname "$J")"
+                JBASE="$(basename "$J")"
+                NEWJ="$JDIR/$JBASE.new"
+
                 if [ -f "$WRK/META-INF/MANIFEST.MF" ]; then
                   (cd "$WRK" && jar cfm "$NEWJ" "META-INF/MANIFEST.MF" . >/dev/null)
                 else
                   (cd "$WRK" && jar cf "$NEWJ" . >/dev/null)
                 fi
+
                 mv -f "$NEWJ" "$J"
               done
             fi
