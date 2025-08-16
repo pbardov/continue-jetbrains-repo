@@ -256,6 +256,7 @@ jobs:
 
           if [ "$built_any" = false ]; then
             echo "WARNING: No plugins were successfully parsed; publishing empty updates.xml" >&2
+          fi
 
       - name: Generate updates.xml
         shell: bash
