@@ -179,16 +179,17 @@ jobs:
                 cp "$SHADOW/config_schema.json" "$WRK/config_schema.json"
                 cp "$SHADOW/continue_rc_schema.json" "$WRK/continue_rc_schema.json"
 
-                # Recreate jar **в той же директории**, используя zip (без jar temp/move)
+                # Recreate jar: сначала собираем внутри $WRK, затем атомарно переносим поверх исходного
                 JDIR="$(dirname "$J")"
                 JBASE="$(basename "$J")"
-                NEWJ="$JDIR/$JBASE.new"
+                NEWJ_LOCAL="$WRK/__rebuilt__.jar"
 
-                rm -f "$NEWJ"
+                rm -f "$NEWJ_LOCAL"
                 # -X: не сохранять extra attrs, -r: рекурсивно, -q: тихо
-                (cd "$WRK" && zip -q -X -r "$NEWJ" .)
+                (cd "$WRK" && zip -q -X -r "__rebuilt__.jar" .)
 
-                mv -f "$NEWJ" "$J"
+                # Переносим готовый jar на место оригинала
+                mv -f "$NEWJ_LOCAL" "$J"
               done
             fi
 
