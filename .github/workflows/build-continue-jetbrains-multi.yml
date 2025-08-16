@@ -179,16 +179,14 @@ jobs:
                 cp "$SHADOW/config_schema.json" "$WRK/config_schema.json"
                 cp "$SHADOW/continue_rc_schema.json" "$WRK/continue_rc_schema.json"
 
-                # Recreate jar **in the same directory as original** to avoid temp move issues
+                # Recreate jar **в той же директории**, используя zip (без jar temp/move)
                 JDIR="$(dirname "$J")"
                 JBASE="$(basename "$J")"
                 NEWJ="$JDIR/$JBASE.new"
 
-                if [ -f "$WRK/META-INF/MANIFEST.MF" ]; then
-                  (cd "$WRK" && jar cfm "$NEWJ" "META-INF/MANIFEST.MF" . >/dev/null)
-                else
-                  (cd "$WRK" && jar cf "$NEWJ" . >/dev/null)
-                fi
+                rm -f "$NEWJ"
+                # -X: не сохранять extra attrs, -r: рекурсивно, -q: тихо
+                (cd "$WRK" && zip -q -X -r "$NEWJ" .)
 
                 mv -f "$NEWJ" "$J"
               done
